@@ -29,6 +29,7 @@ Anything that needs root goes through pkexec (a normal polkit password prompt).
 import copy
 import glob
 import grp
+import json
 import os
 import pwd
 import re
@@ -50,6 +51,7 @@ APP_ID = "io.neighborly.Neighborly"
 CONF = "/etc/samba/smb.conf"
 SPECIAL = {"global", "printers", "print$"}
 YES = {"yes", "true", "1", "on"}
+GRANTS_FILE = os.path.join(GLib.get_user_config_dir(), "neighborly", "acl-grants.json")
 
 # Runs as root: backup old config, install the new one, tell smbd to reload.
 INSTALL_SCRIPT = (
@@ -529,13 +531,70 @@ def _may(st, uid, gids, bit):
     return bool(st.st_mode & bit)
 
 
-def unix_problems(path, users, writable, guest):
-    """Plain-language list of Unix-permission problems for the people who'll use the share."""
+def _has(perms, bit):
+    return perms[{4: 0, 2: 1, 1: 2}[bit]] != "-"
+
+
+def read_acl(path):
+    """Extra (non-default) ACL entries of a path, or None if it has none or getfacl is missing.
+    Returns {'user': {uid: 'r-x'}, 'group': {gid: 'r-x'}, 'owner_group': 'r-x', 'mask': 'r-x'|None}."""
+    exe = shutil.which("getfacl")
+    if not exe:
+        return None
+    try:
+        r = subprocess.run([exe, "-p", "-n", "-c", "--", path], capture_output=True, text=True)
+    except OSError:
+        return None
+    if r.returncode != 0:
+        return None
+    acl = {"user": {}, "group": {}, "owner_group": "---", "mask": None}
+    extended = False
+    for line in r.stdout.splitlines():
+        line = line.split("#")[0].strip()
+        parts = line.split(":")
+        if line.startswith("default:") or len(parts) != 3 or len(parts[2]) != 3:
+            continue
+        kind, who, perms = parts
+        if kind == "user" and who:
+            acl["user"][int(who)] = perms
+            extended = True
+        elif kind == "group" and who:
+            acl["group"][int(who)] = perms
+            extended = True
+        elif kind == "group":
+            acl["owner_group"] = perms
+        elif kind == "mask":
+            acl["mask"] = perms
+    return acl if extended else None
+
+
+def _may_path(path, st, uid, gids, bit):
+    """Like _may, but also honours POSIX ACL entries (e.g. ones added with setfacl)."""
+    if uid == 0:
+        return True
+    acl = read_acl(path) if st.st_uid != uid else None
+    if acl is None:
+        return _may(st, uid, gids, bit)
+    mask = acl["mask"] or "rwx"
+    if uid in acl["user"]:
+        return _has(acl["user"][uid], bit) and _has(mask, bit)
+    group_perms = [p for g, p in acl["group"].items() if g in gids]
+    if st.st_gid in gids:
+        group_perms.append(acl["owner_group"])
+    if group_perms:
+        return any(_has(p, bit) and _has(mask, bit) for p in group_perms)
+    return bool(st.st_mode & bit)
+
+
+def unix_problems(path, users, writable, guest, guest_account="nobody"):
+    """Check Unix permissions for the people who'll use the share.
+    Returns (problems, fixes): plain-language problems, and fixes = [(folder, user, is_guest)]
+    for parent folders that only lack 'enter' (execute) permission for that user."""
     names = [u for u in users if not u.startswith(("@", "+", "&"))]
     guests_only = not users and guest
     if guests_only:
-        names = ["nobody"]
-    problems = []
+        names = [guest_account]
+    problems, fixes = [], []
     for u in names:
         label = "Guests" if guests_only else f"“{u}”"
         try:
@@ -548,7 +607,7 @@ def unix_problems(path, users, writable, guest):
         while d != "/":
             d = os.path.dirname(d)
             try:
-                if not _may(os.stat(d), pw.pw_uid, gids, 1):
+                if not _may_path(d, os.stat(d), pw.pw_uid, gids, 1):
                     blocked = d
                     break
             except OSError:
@@ -556,6 +615,8 @@ def unix_problems(path, users, writable, guest):
         if blocked:
             problems.append(f"{label} can't enter {blocked} (no execute permission), "
                             "so the share would be unreachable.")
+            if not is_blocked_path(blocked):
+                fixes.append((blocked, u, guests_only))
             continue
         try:
             st = os.stat(path)
@@ -566,12 +627,71 @@ def unix_problems(path, users, writable, guest):
         except KeyError:
             owner = str(st.st_uid)
         mode = oct(st.st_mode & 0o777)[2:]
-        if not (_may(st, pw.pw_uid, gids, 4) and _may(st, pw.pw_uid, gids, 1)):
+        if not (_may_path(path, st, pw.pw_uid, gids, 4) and _may_path(path, st, pw.pw_uid, gids, 1)):
             problems.append(f"{label} can't open this folder (owner {owner}, permissions {mode}).")
-        elif writable and not _may(st, pw.pw_uid, gids, 2):
+        elif writable and not _may_path(path, st, pw.pw_uid, gids, 2):
             problems.append(f"{label} can't write in this folder (owner {owner}, permissions {mode}), "
                             "so “Allow changes” would fail.")
-    return problems
+    return problems, fixes
+
+
+# ---- pass-through access (ACL) granted by Neighborly, remembered so it can be undone ----
+def load_grants():
+    try:
+        with open(GRANTS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return [g for g in data.get("grants", [])
+                if isinstance(g, dict) and all(isinstance(g.get(k), str) for k in ("share", "path", "user"))]
+    except (OSError, ValueError, AttributeError):
+        return []
+
+
+def save_grants(grants):
+    os.makedirs(os.path.dirname(GRANTS_FILE), exist_ok=True)
+    tmp = GRANTS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"grants": grants}, f, indent=2)
+    os.replace(tmp, GRANTS_FILE)
+
+
+def _entry(path, user):
+    """Current ACL permissions string for a named user on path, or None."""
+    try:
+        acl = read_acl(path)
+        return acl["user"].get(pwd.getpwnam(user).pw_uid) if acl else None
+    except KeyError:
+        return None
+
+
+def acl_grant_cmd(pairs):
+    """Give each user execute-only (pass-through) access on a folder. One admin prompt."""
+    script = 'while [ $# -gt 1 ]; do setfacl -m "u:$2:x" "$1" || exit 1; shift 2; done'
+    return ["pkexec", "sh", "-c", script, "sh"] + [x for pair in pairs for x in pair]
+
+
+def acl_revoke_cmd(pairs):
+    script = 'while [ $# -gt 1 ]; do setfacl -x "u:$2" "$1" || exit 1; shift 2; done'
+    return ["pkexec", "sh", "-c", script, "sh"] + [x for pair in pairs for x in pair]
+
+
+def grant_is_live(grant, shares):
+    """A grant is still needed while its share exists and lives inside the granted folder."""
+    s = shares.get(grant["share"].lower())
+    if s is None:
+        return False
+    p = os.path.realpath(s.get("path", "") or "/nonexistent")
+    return p == grant["path"] or p.startswith(grant["path"].rstrip("/") + "/")
+
+
+def stale_pairs(grants, shares):
+    """(folder, user) pairs no live grant needs any more."""
+    live = {(g["path"], g["user"]) for g in grants if grant_is_live(g, shares)}
+    out = []
+    for g in grants:
+        pair = (g["path"], g["user"])
+        if pair not in live and pair not in out:
+            out.append(pair)
+    return out
 
 
 def selinux_needs_label(path):
@@ -768,41 +888,95 @@ class ShareDialog(Adw.Window):
         self.check_then_commit(name, path, real)
 
     def check_then_commit(self, name, path, real):
-        issues = unix_problems(real, self.users.get_text().split(),
-                               self.writable.get_active(), self.guest.get_active())
+        g = self.win.conf.find("global")
+        account = (g.get("guest account") if g else None) or "nobody"
+        issues, fixes = unix_problems(real, self.users.get_text().split(),
+                                      self.writable.get_active(), self.guest.get_active(), account)
+        if fixes and not which_sbin("setfacl"):
+            fixes = []  # can't offer the fix without the acl tools
         need_label = selinux_needs_label(real)
         if not issues and not need_label:
             return self._commit(name, path)
         lines = list(issues)
+        by_dir = {}
+        for d, u, is_guest in fixes:
+            by_dir.setdefault(d, []).append("guests" if is_guest else f"“{u}”")
+        for d, who in by_dir.items():
+            lines.append(f"“Fix” lets {', '.join(dict.fromkeys(who))} pass through {d} (enter only: "
+                         "they can't list or read it, and nobody else's access changes). Neighborly "
+                         "remembers this and takes it away again when you stop sharing.")
         buttons = [("cancel", "Go back", None), ("save", "Save anyway", None)]
         if need_label:
             lines.append("SELinux is enforcing and this folder isn't labelled for Samba, so other "
                          "computers will probably get “Permission denied”.")
-            buttons.append(("fix", "Fix label and save", "suggested"))
+        if need_label or fixes:
+            buttons.append(("fix", "Fix and save", "suggested"))
 
         def answer(r):
             if r == "save":
                 self._commit(name, path)
             elif r == "fix":
-                self.fix_label_then_commit(name, path, real)
+                self.fix_then_commit(name, path, real, fixes, need_label)
 
         heads_up(self, "Heads-up before saving", "\n".join("• " + ln for ln in lines),
                  buttons, answer)
 
-    def fix_label_then_commit(self, name, path, real):
+    def fix_then_commit(self, name, path, real, fixes, need_label):
         self.save_btn.set_sensitive(False)
 
-        def done(rc, out, err):
+        def fail(err):
             self.save_btn.set_sensitive(True)
-            if rc == 0:
-                self._commit(name, path)
-            else:
-                alert(self, "Could not fix the label", err.strip() or "Authentication cancelled.")
+            alert(self, "Could not apply the fix", err.strip() or "Authentication cancelled.")
 
-        run_async(selinux_fix_cmd(real), done)
+        def label_step():
+            if not need_label:
+                return self._commit(name, path)
+            run_async(selinux_fix_cmd(real),
+                      lambda rc, out, err: self._commit(name, path) if rc == 0 else fail(err))
+
+        # Only run (and remember) entries that don't exist yet, so we never claim or remove
+        # an ACL entry that was there before us.
+        grants = load_grants()
+        tracked = {(g["path"], g["user"]) for g in grants}
+        todo, record = [], []
+        for d, u, _guest in dict.fromkeys(fixes):
+            if (d, u) in tracked:
+                record.append((d, u))
+            elif _entry(d, u) is None:
+                todo.append((d, u))
+                record.append((d, u))
+        if not record and not todo:
+            return label_step()
+
+        def remember():
+            have = {(g["share"].lower(), g["path"], g["user"]) for g in grants}
+            for d, u in record:
+                if (name.lower(), d, u) not in have:
+                    grants.append({"share": name, "path": d, "user": u})
+            try:
+                save_grants(grants)
+            except OSError as e:
+                return fail(f"The access was granted, but Neighborly couldn't remember it "
+                            f"({e}). Undo it with: setfacl -x u:USER FOLDER")
+            label_step()
+
+        if not todo:
+            return remember()
+        run_async(acl_grant_cmd(todo),
+                  lambda rc, out, err: remember() if rc == 0 else fail(err))
 
     def _commit(self, name, path):
         new = copy.deepcopy(self.win.conf)
+        renamed = bool(self.orig_name) and self.orig_name.lower() != name.lower()
+        if renamed:
+            grants = load_grants()
+            for g in grants:
+                if g["share"].lower() == self.orig_name.lower():
+                    g["share"] = name
+            try:
+                save_grants(grants)
+            except OSError:
+                pass
         sec = new.find(self.orig_name) if self.orig_name else None
         is_new = sec is None
         if is_new:
@@ -819,7 +993,19 @@ class ShareDialog(Adw.Window):
         if is_new:
             new.add(sec)
         self.save_btn.set_sensitive(False)
-        self.win.save_conf(new, done=self.close, failed=lambda: self.save_btn.set_sensitive(True))
+        def failed():
+            if renamed:  # put the remembered access back under the old name
+                grants = load_grants()
+                for g in grants:
+                    if g["share"].lower() == name.lower():
+                        g["share"] = self.orig_name
+                try:
+                    save_grants(grants)
+                except OSError:
+                    pass
+            self.save_btn.set_sensitive(True)
+
+        self.win.save_conf(new, done=self.close, failed=failed)
 
 
 class UserDialog(Adw.Window):
@@ -1143,6 +1329,35 @@ class Window(Adw.ApplicationWindow):
         self.toast("Changes saved and applied")
         if done:
             done()
+        self.release_grants()
+
+    def release_grants(self):
+        """Take back pass-through access Neighborly added that no share needs any more."""
+        grants = load_grants()
+        if not grants:
+            return
+        shares = {s.name.lower(): s for s in self.conf.shares()}
+        pairs = stale_pairs(grants, shares)
+        if not pairs:
+            return
+        keep = [g for g in grants if grant_is_live(g, shares)]
+        # Only remove entries that are still exactly what we added; anything else isn't ours.
+        ours = [(d, u) for d, u in pairs if _entry(d, u) == "--x"]
+
+        def finish(rc, out, err):
+            if rc == 0:
+                try:
+                    save_grants(keep)
+                except OSError:
+                    pass
+                if ours:
+                    self.toast("Removed folder access that Neighborly had added")
+            else:
+                self.toast("Couldn't remove the extra folder access; will retry on the next save")
+
+        if not ours:
+            return finish(0, "", "")
+        run_async(acl_revoke_cmd(ours), finish)
 
     # ---- overview --------------------------------------------------------
     def build_overview(self):
@@ -1356,9 +1571,16 @@ class Window(Adw.ApplicationWindow):
             new.remove(name)
             self.save_conf(new)
 
-        confirm(self, f"Stop sharing “{name}”?",
-                "The folder and its files stay untouched; it just stops being shared.",
-                "Stop sharing", go)
+        body = "The folder and its files stay untouched; it just stops being shared."
+        grants = load_grants()
+        rest = {s.name.lower(): s for s in self.conf.shares() if s.name.lower() != name.lower()}
+        gone = [(d, u) for d, u in stale_pairs(grants, rest)
+                if any(g["share"].lower() == name.lower() and (g["path"], g["user"]) == (d, u)
+                       for g in grants)]
+        if gone:
+            body += ("\n\nNeighborly will also take back the pass-through access it added: "
+                     + ", ".join(f"{u} on {d}" for d, u in gone) + ".")
+        confirm(self, f"Stop sharing “{name}”?", body, "Stop sharing", go)
 
     # ---- users -----------------------------------------------------------
     def build_users(self):

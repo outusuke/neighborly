@@ -51,6 +51,11 @@ Things you used to do in a terminal are handled in the app, each with a confirma
   - refuses system folders and whole-`/home` style paths,
   - checks Unix permissions for the people who'll use the share (including parent folders) and
     explains problems in plain language; it never changes permissions or runs `chmod 777`,
+  - if a parent folder (like your home folder) stops guests or the listed users from entering, offers
+    to let just those users pass through it with an ACL entry (`setfacl -m u:USER:x`, enter only: they
+    can't list or read it). Neighborly remembers what it added in
+    `~/.config/neighborly/acl-grants.json` and removes it again when you stop sharing or move the
+    share elsewhere. ACL entries that were already there are never touched. Needs the `acl` package,
   - on SELinux systems offers to label just that folder `samba_share_t`
     (permanent with `semanage`, otherwise a temporary `chcon`).
 

@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+[Desktop Entry]
+Type=Application
+Name=Neighborly
+GenericName=Samba Share Manager
+Comment=Manage Samba shares, users and connections
+Exec=neighborly
+Icon=network-server
+Terminal=false
+Categories=GNOME;GTK;System;Settings;Network;
+Keywords=samba;smb;share;windows;network;

@@ -27,6 +27,7 @@ Features
 Anything that needs root goes through pkexec (a normal polkit password prompt).
 """
 import copy
+import glob
 import grp
 import os
 import pwd
@@ -37,6 +38,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import xml.etree.ElementTree as ET
 
 import gi
 
@@ -234,17 +236,35 @@ def installed_script():
     return os.path.join(GLib.get_user_data_dir(), "neighborly", "neighborly.py")
 
 
-def install_desktop():
-    """Copy the program to ~/.local/share/neighborly and add a launcher (no root needed).
-
-    The launcher points at the copy, so moving or deleting the download folder
-    doesn't break the menu entry."""
+def ensure_installed_copy():
+    """Copy the program to ~/.local/share/neighborly so launchers keep working
+    if the download folder is moved or deleted. Returns the path of the copy."""
     src = os.path.abspath(__file__)
     script = installed_script()
     os.makedirs(os.path.dirname(script), exist_ok=True)
     if not (os.path.exists(script) and os.path.samefile(src, script)):
         shutil.copy2(src, script)
     os.chmod(script, 0o755)
+    return script
+
+
+def _cleanup_copy():
+    """Delete the installed copy once neither the launcher nor a right-click entry needs it."""
+    if desktop_installed() or context_installed():
+        return
+    try:
+        os.unlink(installed_script())
+    except FileNotFoundError:
+        pass
+    try:
+        os.rmdir(os.path.dirname(installed_script()))  # only if empty
+    except OSError:
+        pass
+
+
+def install_desktop():
+    """Add a launcher to the applications menu (no root needed)."""
+    script = ensure_installed_copy()
     content = (
         "[Desktop Entry]\n"
         "Type=Application\n"
@@ -266,16 +286,12 @@ def install_desktop():
 
 
 def remove_desktop():
-    """Remove the launcher and the copy of the program that was installed for it."""
-    for path in (desktop_file(), installed_script()):
-        try:
-            os.unlink(path)
-        except FileNotFoundError:
-            pass
+    """Remove the launcher (and the installed copy if nothing else uses it)."""
     try:
-        os.rmdir(os.path.dirname(installed_script()))  # only if empty
-    except OSError:
+        os.unlink(desktop_file())
+    except FileNotFoundError:
         pass
+    _cleanup_copy()
     _update_desktop_db(os.path.dirname(desktop_file()))
 
 
@@ -284,6 +300,198 @@ def _update_desktop_db(directory):
         subprocess.run(["update-desktop-database", directory], capture_output=True)
     except FileNotFoundError:
         pass
+
+
+# ---- right-click "Share" entry for file managers --------------------------
+# Every entry just runs: python3 <installed copy> <folder>. Neighborly then opens
+# its share dialog on that folder (and reuses the running window if there is one).
+SHARE_LABEL = "Share on local network…"
+SHARE_COMMENT = "Share this folder with Samba (Neighborly)"
+THUNAR_ID = "neighborly-share-1"
+
+# nautilus-python extension. @SCRIPT@ is replaced with the installed program's path.
+NAUTILUS_EXTENSION = '''# SPDX-License-Identifier: GPL-3.0-or-later
+# Installed by Neighborly: adds "Share on local network…" to the Files right-click menu.
+import subprocess
+
+from gi.repository import GObject, Nautilus
+
+SCRIPT = @SCRIPT@
+
+
+class NeighborlyShare(GObject.GObject, Nautilus.MenuProvider):
+    @staticmethod
+    def _folder(info):
+        if info is None or info.get_uri_scheme() != "file" or not info.is_directory():
+            return None
+        return info.get_location().get_path()
+
+    def _items(self, kind, folder):
+        if not folder:
+            return []
+        item = Nautilus.MenuItem(name="NeighborlyShare::" + kind,
+                                 label="Share on local network…",
+                                 tip="Share this folder with Samba (Neighborly)",
+                                 icon="folder-publicshare-symbolic")
+        item.connect("activate", self._share, folder)
+        return [item]
+
+    # Nautilus 4 passes (files); older versions pass (window, files).
+    def get_file_items(self, *args):
+        files = args[-1]
+        return self._items("file", self._folder(files[0])) if len(files) == 1 else []
+
+    def get_background_items(self, *args):
+        return self._items("background", self._folder(args[-1]))
+
+    @staticmethod
+    def _share(_item, folder):
+        subprocess.Popen(["python3", SCRIPT, folder], start_new_session=True)
+'''
+
+
+def nautilus_script(script):
+    """Fallback for Nautilus without nautilus-python: shows up under right-click > Scripts."""
+    return f'''#!/bin/sh
+# Installed by Neighborly: right-click > Scripts > Share on local network
+dir=$(printf '%s\\n' "$NAUTILUS_SCRIPT_SELECTED_FILE_PATHS" | head -n 1)
+if [ -z "$dir" ]; then
+    dir=$(python3 -c 'import sys, urllib.parse as u; print(u.unquote(u.urlparse(sys.argv[1]).path))' "$NAUTILUS_SCRIPT_CURRENT_URI")
+fi
+exec python3 "{script}" "$dir"
+'''
+
+
+def _data(*parts):
+    return os.path.join(GLib.get_user_data_dir(), *parts)
+
+
+def _entry_paths():
+    return {
+        "nautilus-ext": _data("nautilus-python", "extensions", "neighborly_share.py"),
+        "nautilus-script": _data("nautilus", "scripts", "Share on local network"),
+        "nemo": _data("nemo", "actions", "neighborly-share.nemo_action"),
+        "dolphin": _data("kio", "servicemenus", "neighborly-share.desktop"),
+        "libfm": _data("file-manager", "actions", "neighborly-share.desktop"),  # PCManFM
+    }
+
+
+def thunar_uca():
+    return os.path.join(GLib.get_user_config_dir(), "Thunar", "uca.xml")
+
+
+def _write(path, text, mode=0o644):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.chmod(path, mode)
+
+
+def _remove(path):
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
+def has_nautilus_python():
+    pats = ("/usr/lib*/nautilus/extensions-*/libnautilus-python.so",
+            "/usr/lib/*/nautilus/extensions-*/libnautilus-python.so",
+            "/usr/local/lib*/nautilus/extensions-*/libnautilus-python.so")
+    return any(glob.glob(p) for p in pats)
+
+
+def _thunar_has():
+    try:
+        root = ET.parse(thunar_uca()).getroot()
+    except (OSError, ET.ParseError):
+        return False
+    return any(a.findtext("unique-id") == THUNAR_ID for a in root.findall("action"))
+
+
+def _thunar_update(add, command=None):
+    """Add/remove our custom action in Thunar's uca.xml (original is backed up once)."""
+    path = thunar_uca()
+    if not add and not _thunar_has():
+        return
+    if not os.path.exists(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        base = "/etc/xdg/Thunar/uca.xml"  # keep Thunar's default actions
+        if os.path.exists(base):
+            shutil.copy(base, path)
+        else:
+            _write(path, '<?xml version="1.0" encoding="UTF-8"?>\n<actions>\n</actions>\n')
+    elif not os.path.exists(path + ".bak"):
+        shutil.copy2(path, path + ".bak")
+    tree = ET.parse(path)
+    root = tree.getroot()
+    for a in root.findall("action"):
+        if a.findtext("unique-id") == THUNAR_ID:
+            root.remove(a)
+    if add:
+        a = ET.SubElement(root, "action")
+        for tag, text in (("icon", "folder-publicshare"), ("name", SHARE_LABEL),
+                          ("unique-id", THUNAR_ID), ("command", command),
+                          ("description", SHARE_COMMENT), ("patterns", "*")):
+            ET.SubElement(a, tag).text = text
+        ET.SubElement(a, "directories")
+    if hasattr(ET, "indent"):
+        ET.indent(tree)
+    tree.write(path, encoding="UTF-8", xml_declaration=True)
+
+
+def context_installed():
+    return any(os.path.exists(p) for p in _entry_paths().values()) or _thunar_has()
+
+
+def install_context_menu():
+    """Add the right-click entry to every supported file manager found on this computer.
+    Returns a list of (file manager, note)."""
+    paths = _entry_paths()
+    found = []
+    have = {n: shutil.which(n) for n in ("nautilus", "nemo", "dolphin", "thunar", "pcmanfm", "pcmanfm-qt")}
+    if not any(have.values()):
+        return found
+    script = ensure_installed_copy()
+    exe = f'python3 "{script}"'
+    if have["nautilus"]:
+        if has_nautilus_python():
+            _write(paths["nautilus-ext"], NAUTILUS_EXTENSION.replace("@SCRIPT@", repr(script)))
+            _remove(paths["nautilus-script"])
+            found.append(("Nautilus", "restart it with “nautilus -q” to see the entry"))
+        else:
+            _write(paths["nautilus-script"], nautilus_script(script), 0o755)
+            _remove(paths["nautilus-ext"])
+            found.append(("Nautilus", "find it under right-click › Scripts (install nautilus-python "
+                                      "for a top-level entry)"))
+    if have["nemo"]:
+        _write(paths["nemo"], f"[Nemo Action]\nName={SHARE_LABEL}\nComment={SHARE_COMMENT}\n"
+                              f"Exec={exe} %F\nIcon-Name=folder-publicshare-symbolic\n"
+                              "Selection=s\nExtensions=dir;\nQuote=double\n")
+        found.append(("Nemo", "appears right away"))
+    if have["dolphin"]:
+        _write(paths["dolphin"], "[Desktop Entry]\nType=Service\nServiceTypes=KonqPopupMenu/Plugin\n"
+                                 "MimeType=inode/directory;\nActions=neighborlyShare;\n"
+                                 "X-KDE-Priority=TopLevel\n\n[Desktop Action neighborlyShare]\n"
+                                 f"Name={SHARE_LABEL}\nIcon=folder-publicshare\nExec={exe} %f\n", 0o755)
+        found.append(("Dolphin", "appears right away"))
+    if have["pcmanfm"] or have["pcmanfm-qt"]:
+        _write(paths["libfm"], f"[Desktop Entry]\nType=Action\nName={SHARE_LABEL}\n"
+                               "Icon=folder-publicshare\nProfiles=profile-zero;\n\n"
+                               "[X-Action-Profile profile-zero]\nMimeTypes=inode/directory;\n"
+                               f"Exec={exe} %f\n")
+        found.append(("PCManFM", "appears right away"))
+    if have["thunar"]:
+        _thunar_update(True, f"{exe} %f")
+        found.append(("Thunar", "restart it with “thunar -q” to see the entry"))
+    return found
+
+
+def remove_context_menu():
+    for p in _entry_paths().values():
+        _remove(p)
+    _thunar_update(False)
+    _cleanup_copy()
 
 
 # ---- safety helpers: folders, permissions, SELinux, accounts, firewall ----
@@ -468,7 +676,7 @@ def esc(text):
 # dialogs
 # --------------------------------------------------------------------------
 class ShareDialog(Adw.Window):
-    def __init__(self, win, section=None):
+    def __init__(self, win, section=None, folder=None):
         super().__init__(transient_for=win, modal=True, default_width=500, default_height=660,
                          title="Edit shared folder" if section else "New shared folder")
         self.win = win
@@ -518,6 +726,9 @@ class ShareDialog(Adw.Window):
             self.users.set_text(section.get("valid users", ""))
         else:
             self.browseable.set_active(True)
+            if folder:  # opened from a file manager's right-click menu
+                self.path.set_text(folder)
+                self.name.set_text(os.path.basename(folder.rstrip("/")) or "share")
 
         view.set_content(page)
         self.set_content(view)
@@ -725,6 +936,8 @@ class Window(Adw.ApplicationWindow):
         menu = Gio.Menu()
         menu.append("Add to applications menu", "win.add-to-menu")
         menu.append("Remove from applications menu", "win.remove-from-menu")
+        menu.append("Add “Share” to file managers' right-click menu", "win.add-context")
+        menu.append("Remove “Share” from right-click menus", "win.remove-context")
         menu.append("About Neighborly", "win.about")
         sb_header.pack_end(Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu,
                                           primary=True, tooltip_text="Main menu"))
@@ -766,6 +979,8 @@ class Window(Adw.ApplicationWindow):
     def setup_menu_actions(self):
         for name, cb in (("add-to-menu", self.on_add_to_menu),
                          ("remove-from-menu", self.on_remove_from_menu),
+                         ("add-context", self.on_add_context),
+                         ("remove-context", self.on_remove_context),
                          ("about", self.on_about)):
             action = Gio.SimpleAction.new(name, None)
             action.connect("activate", cb)
@@ -776,6 +991,30 @@ class Window(Adw.ApplicationWindow):
         installed = desktop_installed()
         self.lookup_action("add-to-menu").set_enabled(not installed)
         self.lookup_action("remove-from-menu").set_enabled(installed)
+        ctx = context_installed()
+        self.lookup_action("add-context").set_enabled(not ctx)
+        self.lookup_action("remove-context").set_enabled(ctx)
+
+    def on_add_context(self, *_):
+        try:
+            found = install_context_menu()
+        except (OSError, ET.ParseError) as e:
+            alert(self, "Could not add the right-click entry", str(e))
+            return self.sync_menu_actions()
+        self.sync_menu_actions()
+        if not found:
+            return alert(self, "No supported file manager found",
+                         "Neighborly can add a “Share on local network…” entry to Nautilus, Nemo, "
+                         "Dolphin, Thunar and PCManFM, but none of them was found on this computer.")
+        alert(self, "Right-click entry added", "\n".join(f"• {n}: {note}" for n, note in found))
+
+    def on_remove_context(self, *_):
+        try:
+            remove_context_menu()
+            self.toast("Removed from right-click menus")
+        except (OSError, ET.ParseError) as e:
+            alert(self, "Could not remove the right-click entry", str(e))
+        self.sync_menu_actions()
 
     def on_add_to_menu(self, *_):
         try:
@@ -804,6 +1043,21 @@ class Window(Adw.ApplicationWindow):
                                 application_icon="network-server",
                                 comments="A friendly way to manage and use Samba.", version="1.0")
             d.present()
+
+    def share_folder(self, path):
+        """Open the share dialog for a folder (used by the file managers' right-click entry)."""
+        path = os.path.realpath(path)
+        if not os.path.isdir(path):
+            self.toast(f"“{path}” is not a folder")
+            return
+        for i, (key, _title, _icon) in enumerate(self.PAGES):
+            if key == "shares":
+                self.sidebar.select_row(self.sidebar.get_row_at_index(i))
+        for s in self.conf.shares():
+            shared = s.get("path")
+            if shared and os.path.realpath(shared) == path:  # already shared: edit it
+                return ShareDialog(self, s).present()
+        ShareDialog(self, folder=path).present()
 
     # ---- plumbing --------------------------------------------------------
     def toast(self, text):
@@ -1220,11 +1474,21 @@ class Window(Adw.ApplicationWindow):
 
 class App(Adw.Application):
     def __init__(self):
-        super().__init__(application_id=APP_ID)
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.HANDLES_OPEN)
+
+    def _window(self):
+        return self.props.active_window or Window(self)
 
     def do_activate(self):
-        win = self.props.active_window or Window(self)
+        self._window().present()
+
+    def do_open(self, files, *_):
+        """`neighborly /some/folder` opens the share dialog for that folder."""
+        win = self._window()
         win.present()
+        path = files[0].get_path() if files else None
+        if path:
+            win.share_folder(path)
 
 
 if __name__ == "__main__":

@@ -54,6 +54,24 @@ Things you used to do in a terminal are handled in the app, each with a confirma
   - on SELinux systems offers to label just that folder `samba_share_t`
     (permanent with `semanage`, otherwise a temporary `chcon`).
 
+## Right-click "Share on local network…"
+
+Like the old `nautilus-share`, but not tied to one file manager. In the ☰ menu choose
+**Add “Share” to file managers' right-click menu**; Neighborly adds the entry to every
+supported file manager it finds, with no root needed:
+
+| File manager | Result |
+|---|---|
+| Nautilus (Files) | Top-level entry if `nautilus-python` is installed (`python3-nautilus` / `nautilus-python`), otherwise under right-click › Scripts. Restart with `nautilus -q`. |
+| Nemo | Right-click entry |
+| Dolphin | Right-click entry |
+| Thunar | Custom action (your existing actions are kept, `uca.xml.bak` is saved). Restart with `thunar -q`. |
+| PCManFM / PCManFM-Qt | Right-click entry |
+
+The entry opens Neighborly's share dialog on that folder (or edits the share if the folder is
+already shared). You can also run it directly: `python3 neighborly.py /path/to/folder`.
+Use **Remove “Share” from right-click menus** in the same menu to undo everything.
+
 ## License
 
 Neighborly is free software: you can redistribute it and/or modify it under the terms of the

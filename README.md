@@ -10,7 +10,9 @@ A small GTK4 + libadwaita app to manage and use Samba without touching `smb.conf
 - **Shared folders** – add, edit, remove shares (read/write, guests, allowed users, hidden)
 - **Users** – add Samba users, change passwords, remove them
 - **Connections** – see who is connected (`smbstatus`)
-- **Connect** – open other computers' shares or browse the network in your file manager
+- **Connect** – open other computers' shares or browse the network in your file manager;
+  test your own shares natively (`systemctl is-active`, `smbclient -L localhost -N`,
+  `smbclient //localhost/share -N -c ls`) without opening a file manager
 
 Your comments and other settings in `/etc/samba/smb.conf` are preserved. Every save is
 validated with `testparm`, the previous file is kept as `smb.conf.bak`, and Samba reloads
@@ -20,9 +22,9 @@ its config automatically. Anything that needs root asks for your password via po
 
 | Distro | Install |
 |---|---|
-| Debian / Ubuntu (24.04+) | `sudo apt install python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 samba samba-common-bin policykit-1` |
-| Fedora | `sudo dnf install python3-gobject gtk4 libadwaita samba polkit` |
-| Arch | `sudo pacman -S python-gobject gtk4 libadwaita samba polkit` |
+| Debian / Ubuntu (24.04+) | `sudo apt install python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 samba samba-common-bin smbclient policykit-1` |
+| Fedora | `sudo dnf install python3-gobject gtk4 libadwaita samba samba-client polkit` |
+| Arch | `sudo pacman -S python-gobject gtk4 libadwaita samba smbclient polkit` |
 
 Needs libadwaita 1.4 or newer.
 

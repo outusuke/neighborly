@@ -719,6 +719,21 @@ def selinux_fix_cmd(path):
     return ["pkexec", "sh", "-c", script, "sh", path, rx]
 
 
+def gvfs_smb_install_hint():
+    """Install command for the file manager's SMB support, matched to this distro."""
+    try:
+        with open("/etc/os-release", encoding="utf-8") as f:
+            ids = re.findall(r'^(?:ID|ID_LIKE)="?([^"\n]+)"?', f.read(), re.M)
+        ids = " ".join(ids).split()
+    except OSError:
+        ids = []
+    if {"debian", "ubuntu"} & set(ids):
+        return "sudo apt install gvfs-backends"
+    if "arch" in ids:
+        return "sudo pacman -S gvfs-smb"
+    return "sudo dnf install gvfs-smb"
+
+
 def detect_firewall():
     if shutil.which("firewall-cmd"):
         return "firewalld"
@@ -1090,6 +1105,91 @@ class UserDialog(Adw.Window):
 # --------------------------------------------------------------------------
 # main window
 # --------------------------------------------------------------------------
+def smb_check_steps(service, share=None):
+    """Native checks for this computer's Samba: (title, command) pairs, run in order."""
+    steps = [("Service is running", ["systemctl", "is-active", f"{service}.service"]),
+             ("Shares are listed", ["smbclient", "-L", "localhost", "-N"])]
+    if share:
+        steps.append((f"Share “{share}” can be opened",
+                      ["smbclient", f"//localhost/{share}", "-N", "-c", "ls"]))
+    return steps
+
+
+def explain_smb_failure(out):
+    """Turn common smbclient errors into plain language."""
+    if "NT_STATUS_ACCESS_DENIED" in out or "NT_STATUS_LOGON_FAILURE" in out:
+        return "This needs a login (guests are not allowed), so the anonymous check was refused."
+    if "NT_STATUS_BAD_NETWORK_NAME" in out:
+        return "Samba does not know a share with that name. Has the config been reloaded?"
+    if "Connection refused" in out or "NT_STATUS_CONNECTION_REFUSED" in out:
+        return "Samba is not accepting connections. Is the service running?"
+    return ""
+
+
+class CheckDialog(Adw.Window):
+    """Runs systemctl / smbclient checks against this computer and shows the results."""
+
+    def __init__(self, win, service, share=None):
+        super().__init__(transient_for=win, modal=True, default_width=620, default_height=480,
+                         title=f"Check “{share}”" if share else "Check this computer's shares")
+        self.service, self.share = service, share
+        tv = Adw.ToolbarView()
+        self.set_content(tv)
+        tv.add_top_bar(Adw.HeaderBar())
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
+                      margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
+        tv.set_content(box)
+        self.group = Adw.PreferencesGroup()
+        box.append(self.group)
+        self.rows = []
+        for title, _cmd in smb_check_steps(service, share):
+            row = Adw.ActionRow(title=esc(title), subtitle="Waiting…")
+            icon = Gtk.Image(icon_name="content-loading-symbolic")
+            row.add_prefix(icon)
+            self.group.add(row)
+            self.rows.append((row, icon))
+        self.out = Gtk.TextView(editable=False, monospace=True, cursor_visible=False,
+                                wrap_mode=Gtk.WrapMode.WORD_CHAR, top_margin=8, bottom_margin=8,
+                                left_margin=8, right_margin=8)
+        sc = Gtk.ScrolledWindow(vexpand=True, child=self.out)
+        sc.add_css_class("card")
+        box.append(sc)
+        again = Gtk.Button(label="Run again", halign=Gtk.Align.END)
+        again.connect("clicked", lambda _b: self.start())
+        box.append(again)
+        self.start()
+
+    def start(self):
+        for row, icon in self.rows:
+            row.set_subtitle("Waiting…")
+            icon.set_from_icon_name("content-loading-symbolic")
+        self.out.get_buffer().set_text("")
+        steps = smb_check_steps(self.service, self.share)
+
+        def work():
+            for i, (_title, cmd) in enumerate(steps):
+                try:
+                    r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True,
+                                       text=True, timeout=20)
+                    rc, text = r.returncode, (r.stdout + r.stderr).strip()
+                except FileNotFoundError:
+                    rc, text = 127, f"'{cmd[0]}' was not found. Install the smbclient package."
+                except subprocess.TimeoutExpired:
+                    rc, text = 124, "Timed out after 20 seconds."
+                GLib.idle_add(self.show_step, i, cmd, rc, text)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def show_step(self, i, cmd, rc, text):
+        row, icon = self.rows[i]
+        ok = rc == 0
+        icon.set_from_icon_name("emblem-ok-symbolic" if ok else "dialog-error-symbolic")
+        row.set_subtitle("OK" if ok else esc(explain_smb_failure(text) or f"Failed (exit {rc})"))
+        buf = self.out.get_buffer()
+        buf.insert(buf.get_end_iter(), f"$ {' '.join(cmd)}\n{text}\n\n")
+        return False
+
+
 class Window(Adw.ApplicationWindow):
     PAGES = [
         ("overview", "Overview", "network-server-symbolic"),
@@ -1257,10 +1357,40 @@ class Window(Adw.ApplicationWindow):
         self.split.set_show_content(True)
 
     def open_uri(self, uri):
+        if uri.startswith("smb://") and \
+                "smb" not in (Gio.Vfs.get_default().get_supported_uri_schemes() or []):
+            return alert(self, "Your file manager can't open network shares yet",
+                         f"It needs the SMB add-on. Install it with:\n\n{gvfs_smb_install_hint()}\n\n"
+                         "then log out and back in.")
+        self.toast("Opening in your file manager…")
+        # Hand the address to the default file manager, which mounts network locations itself.
+        errors = []
+        try:
+            app = Gio.AppInfo.get_default_for_type("inode/directory", False)
+            if app is not None and app.launch_uris([uri], None):
+                return
+        except GLib.Error as e:
+            errors.append(e.message)
+        for fm in ("nautilus", "nemo", "dolphin", "thunar", "pcmanfm-qt", "pcmanfm", "caja"):
+            exe = shutil.which(fm)
+            if exe:
+                try:
+                    subprocess.Popen([exe, uri], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL, start_new_session=True)
+                    return
+                except OSError as e:
+                    errors.append(str(e))
         try:
             Gio.AppInfo.launch_default_for_uri(uri, None)
         except GLib.Error as e:
-            self.toast(f"Could not open {uri}: {e.message}")
+            errors.append(e.message)
+            alert(self, "Could not open the location",
+                  f"{uri}\n\n{errors[-1]}\n\nYou can paste that address into your file manager's "
+                  "“Other locations” bar instead.")
+
+    def check_local(self, share=None):
+        """Test this computer's own Samba natively (no file manager involved)."""
+        CheckDialog(self, self.service, share).present()
 
     def copy_text(self, text):
         self.get_clipboard().set(text)
@@ -1554,8 +1684,8 @@ class Window(Adw.ApplicationWindow):
                 bits.append("Hidden")
             row = Adw.ActionRow(title=esc(s.name), subtitle=esc("  ·  ".join(b for b in bits if b)))
             row.add_prefix(Gtk.Image(icon_name="folder-publicshare-symbolic"))
-            row.add_suffix(icon_button("folder-open-symbolic", "Open in Files",
-                                       self.open_uri, f"smb://localhost/{s.name}"))
+            row.add_suffix(icon_button("emblem-ok-symbolic", "Test this share",
+                                       self.check_local, s.name))
             row.add_suffix(icon_button("edit-copy-symbolic", "Copy network address",
                                        self.copy_text, f"smb://{host}/{s.name}"))
             row.add_suffix(icon_button("document-edit-symbolic", "Edit",
@@ -1680,12 +1810,19 @@ class Window(Adw.ApplicationWindow):
         g.add(self.server_row)
         for title, sub, uri in (
             ("Browse the network", "See computers and shares nearby", "network:///"),
-            ("This computer's shares", "Check how your shares look to others", "smb://localhost/"),
         ):
             row = Adw.ActionRow(title=title, subtitle=sub, activatable=True)
             row.add_suffix(Gtk.Image(icon_name="go-next-symbolic"))
             row.connect("activated", lambda _r, u=uri: self.open_uri(u))
             g.add(row)
+        g2 = Adw.PreferencesGroup(title="This computer")
+        page.add(g2)
+        row = Adw.ActionRow(title="Test this computer's shares",
+                            subtitle="Checks the service and lists your shares with smbclient",
+                            activatable=True)
+        row.add_suffix(Gtk.Image(icon_name="go-next-symbolic"))
+        row.connect("activated", lambda _r: self.check_local())
+        g2.add(row)
         return page
 
     def on_connect(self, row):

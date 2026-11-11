@@ -47,8 +47,10 @@ Things you used to do in a terminal are handled in the app, each with a confirma
 
 - **Users → Add user:** if the system account doesn't exist, the app offers to create it
   (no home folder, no login shell) and sets the Samba password in a single admin prompt.
-- **Overview → Firewall:** detects firewalld or ufw and opens/closes only the `samba` service.
-  Opening it shows a warning about untrusted networks.
+- **Overview → Firewall:** detects firewalld or ufw. *Allow* opens Samba to your **local network only**
+  (private address ranges: `10/8`, `172.16/12`, `192.168/16`, link-local, and VPNs like Tailscale),
+  never to the whole internet; *Block* removes those rules. To reach shares remotely, use a VPN.
+  Opening it asks for confirmation first.
 - **Shared folders → Add/Edit:** before saving, the app
   - refuses system folders and whole-`/home` style paths,
   - checks Unix permissions for the people who'll use the share (including parent folders) and

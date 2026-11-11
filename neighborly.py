@@ -742,6 +742,43 @@ def detect_firewall():
     return None
 
 
+# Private address ranges: home/office LANs, link-local, and VPNs such as Tailscale.
+# Samba is only opened to these, never to the whole internet.
+LAN_V4 = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "100.64.0.0/10")
+LAN_V6 = ("fe80::/10", "fc00::/7")
+
+
+def firewalld_rule(addr):
+    fam = "ipv6" if ":" in addr else "ipv4"
+    return f'rule family="{fam}" source address="{addr}" service name="samba" accept'
+
+
+def firewall_script(kind, action):
+    """Shell script (run as root) that allows Samba on the local network only, or removes it."""
+    if kind == "firewalld":
+        if action == "allow":
+            lines = ["set -e",
+                     "firewall-cmd --permanent --remove-service=samba >/dev/null 2>&1 || true"]
+            lines += [f"firewall-cmd --permanent --add-rich-rule='{firewalld_rule(a)}'"
+                      for a in LAN_V4 + LAN_V6]
+        else:
+            lines = ["firewall-cmd --permanent --remove-service=samba >/dev/null 2>&1 || true"]
+            lines += [f"firewall-cmd --permanent --remove-rich-rule='{firewalld_rule(a)}' "
+                      ">/dev/null 2>&1 || true" for a in LAN_V4 + LAN_V6]
+        lines.append("firewall-cmd --reload")
+        return "; ".join(lines)
+    # ufw
+    if action == "allow":
+        lines = ["set -e", "ufw delete allow Samba >/dev/null 2>&1 || true"]
+        lines += [f"ufw allow from {a} to any app Samba" for a in LAN_V4]
+        lines += [f"ufw allow from {a} to any app Samba || true" for a in LAN_V6]
+    else:
+        lines = ["ufw delete allow Samba >/dev/null 2>&1 || true"]
+        lines += [f"ufw delete allow from {a} to any app Samba >/dev/null 2>&1 || true"
+                  for a in LAN_V4 + LAN_V6]
+    return "; ".join(lines)
+
+
 def heads_up(parent, heading, body, buttons, callback):
     """Dialog with custom buttons: buttons = [(id, label, style)], style None/'suggested'/'destructive'.
     One button must have id 'cancel'. callback(response_id) is called for any response."""
@@ -1522,7 +1559,7 @@ class Window(Adw.ApplicationWindow):
         g2.add(row)
 
         gf = Adw.PreferencesGroup(title="Firewall",
-                                  description="Let other computers on your network reach your shares")
+                                  description="Let computers on your local network reach your shares")
         page.add(gf)
         self.fw_row = Adw.ActionRow(title="Samba through the firewall", subtitle="Checking…")
         fw_box = Gtk.Box(spacing=6, valign=Gtk.Align.CENTER)
@@ -1610,25 +1647,27 @@ class Window(Adw.ApplicationWindow):
             words = out.split()
             if not words or words[0] != "running":
                 sub = "firewalld is not running, so nothing is blocking Samba"
-            elif len(words) >= 3:
-                state = "allowed" if words[2] == "yes" else "blocked"
+            elif len(words) >= 4:
+                if words[2] == "yes":
+                    state = "open to everyone (press Allow to limit it to the local network)"
+                elif words[3] == "yes":
+                    state = "allowed on the local network only"
+                else:
+                    state = "blocked"
                 sub = f"firewalld · zone “{words[1]}” · Samba is {state}"
             else:
                 sub = "Could not read the firewall status"
             self.fw_row.set_subtitle(esc(sub))
 
+        probe = firewalld_rule(LAN_V4[2])
         run_async(["sh", "-c", "firewall-cmd --state; firewall-cmd --get-default-zone; "
-                               "firewall-cmd --query-service=samba"], done)
+                               "firewall-cmd --query-service=samba; "
+                               f"firewall-cmd --query-rich-rule='{probe}'"], done)
 
     def firewall_action(self, action):
-        if self.firewall == "firewalld":
-            flag = "--add-service=samba" if action == "allow" else "--remove-service=samba"
-            cmd = ["pkexec", "sh", "-c", f"firewall-cmd --permanent {flag} && firewall-cmd --reload"]
-        elif self.firewall == "ufw":
-            cmd = ["pkexec", "ufw", "allow", "samba"] if action == "allow" \
-                else ["pkexec", "ufw", "delete", "allow", "samba"]
-        else:
+        if self.firewall not in ("firewalld", "ufw"):
             return
+        cmd = ["pkexec", "sh", "-c", firewall_script(self.firewall, action)]
 
         def run():
             def done(rc, out, err):
@@ -1642,10 +1681,10 @@ class Window(Adw.ApplicationWindow):
             run_async(cmd, done)
 
         if action == "allow":
-            heads_up(self, "Allow Samba through the firewall?",
-                     "Other computers on the network will be able to reach Samba (ports 139 and 445). "
-                     "Only do this on networks you trust, like home or office, and not on public "
-                     "Wi-Fi or a server exposed to the internet.",
+            heads_up(self, "Allow Samba on your local network?",
+                     "Computers on your home or office network (and VPNs like Tailscale) will be "
+                     "able to reach Samba on ports 139 and 445. It stays closed to the rest of "
+                     "the internet. To reach your shares from outside, use a VPN.",
                      [("cancel", "Cancel", None), ("ok", "Allow", "suggested")],
                      lambda r: r == "ok" and run())
         else:

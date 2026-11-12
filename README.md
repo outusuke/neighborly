@@ -18,6 +18,8 @@ Your comments and other settings in `/etc/samba/smb.conf` are preserved. Every s
 validated with `testparm`, the previous file is kept as `smb.conf.bak`, and Samba reloads
 its config automatically. Anything that needs root asks for your password via polkit (`pkexec`).
 
+![Neighborly window](docs/screenshot.png)
+
 ## Dependencies
 
 | Distro | Install |
